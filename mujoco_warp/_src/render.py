@@ -510,7 +510,7 @@ def render_megakernel(m: Model, d: Data, rc: RenderContext):
   if rc.render_depth:
     rc.depth.fill_(float(0.0))
 
-  @nested_kernel(module="unique", enable_backward="False")
+  @nested_kernel(enable_backward="False")
   def _render_megakernel(
     # Model and Options
     nworld: int,
