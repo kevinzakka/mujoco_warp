@@ -41,9 +41,9 @@ MAX_NUM_VIEWS_PER_THREAD = 8
 
 BACKGROUND_COLOR = (
   255 << 24 |
-  int(0.2 * 255.0) << 16 |
+  int(0.1 * 255.0) << 16 |
   int(0.1 * 255.0) << 8 |
-  int(0.1 * 255.0)
+  int(0.2 * 255.0)
 )
 
 SPOT_INNER_COS = float(0.95)
@@ -107,7 +107,7 @@ def pack_rgba_to_uint32(r: wp.uint8, g: wp.uint8, b: wp.uint8, a: wp.uint8) -> w
 @wp.func
 def pack_rgba_to_uint32(r: float, g: float, b: float, a: float) -> wp.uint32:
   """Pack RGBA values into a single uint32 for efficient memory access."""
-  return (wp.uint32(a) << wp.uint32(24)) | (wp.uint32(b) << wp.uint32(16)) | (wp.uint32(g) << wp.uint32(8)) | wp.uint32(r)
+  return (wp.uint32(a) << wp.uint32(24)) | (wp.uint32(r) << wp.uint32(16)) | (wp.uint32(g) << wp.uint32(8)) | wp.uint32(b)
 
 
 @wp.func
@@ -640,40 +640,37 @@ def render_megakernel(m: Model, d: Data, rc: RenderContext):
 
       if wp.static(rc.use_textures):
         mat_id = geom_matid[world_idx, geom_id]
-        if mat_id < 0:
-          continue
-        tex_id = mat_texid[world_idx, mat_id, 1]
-        if tex_id < 0:
-          continue
-
-        tex_color = sample_texture(
-          world_idx,
-          geom_id,
-          geom_type,
-          mat_id,
-          tex_id,
-          mat_texrepeat[world_idx, mat_id],
-          tex_adr[tex_id],
-          tex_data,
-          tex_height[tex_id],
-          tex_width[tex_id],
-          geom_xpos[world_idx, geom_id],
-          geom_xmat[world_idx, geom_id],
-          mesh_faceadr,
-          mesh_face,
-          mesh_texcoord,
-          mesh_texcoord_offsets,
-          hit_point,
-          u,
-          v,
-          f,
-          mesh_id,
-        )
-        base_color = wp.vec3(
-          base_color[0] * tex_color[0],
-          base_color[1] * tex_color[1],
-          base_color[2] * tex_color[2],
-        )
+        if mat_id >= 0:
+          tex_id = mat_texid[world_idx, mat_id, 1]
+          if tex_id >= 0:
+            tex_color = sample_texture(
+              world_idx,
+              geom_id,
+              geom_type,
+              mat_id,
+              tex_id,
+              mat_texrepeat[world_idx, mat_id],
+              tex_adr[tex_id],
+              tex_data,
+              tex_height[tex_id],
+              tex_width[tex_id],
+              geom_xpos[world_idx, geom_id],
+              geom_xmat[world_idx, geom_id],
+              mesh_faceadr,
+              mesh_face,
+              mesh_texcoord,
+              mesh_texcoord_offsets,
+              hit_point,
+              u,
+              v,
+              f,
+              mesh_id,
+            )
+            base_color = wp.vec3(
+              base_color[0] * tex_color[0],
+              base_color[1] * tex_color[1],
+              base_color[2] * tex_color[2],
+            )
 
       len_n = wp.length(normal)
       n = normal if len_n > 0.0 else AMBIENT_UP
