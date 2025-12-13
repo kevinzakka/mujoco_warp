@@ -678,8 +678,31 @@ def ccd_kernel_builder(
             hfield_contact_pos[count, 1] = pos[1]
             hfield_contact_pos[count, 2] = pos[2]
 
-            frame = make_frame(w1 - w2)
+            # compute contact normal from witness points
+            normal_vec = w1 - w2
+            normal_len_sq = wp.dot(normal_vec, normal_vec)
+
+            # handle degenerate case: use heightfield surface normal as fallback
+            # this occurs when witness points are nearly identical
+            if normal_len_sq < 1e-20:
+              # compute surface normal from prism top triangle (vertices 3, 4, 5)
+              v0 = prism[3]
+              v1 = prism[4]
+              v2 = prism[5]
+              edge1 = v1 - v0
+              edge2 = v2 - v0
+              surface_normal = wp.cross(edge1, edge2)
+              normal_len_sq_fallback = wp.dot(surface_normal, surface_normal)
+
+              # if surface normal is also degenerate, skip this contact
+              if normal_len_sq_fallback < 1e-20:
+                continue
+
+              normal_vec = surface_normal
+
+            frame = make_frame(normal_vec)
             normal = wp.vec3(frame[0, 0], frame[0, 1], frame[0, 2])
+
             hfield_contact_normal[count, 0] = normal[0]
             hfield_contact_normal[count, 1] = normal[1]
             hfield_contact_normal[count, 2] = normal[2]
