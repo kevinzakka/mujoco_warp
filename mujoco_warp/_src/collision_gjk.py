@@ -92,8 +92,7 @@ def support(geom: Geom, geomtype: int, dir: wp.vec3) -> SupportPoint:
   sp.cached_index = -1
   sp.vertex_index = -1
   if geomtype == GeomType.SPHERE:
-    sp.point = geom.pos + (0.5 * geom.margin) * geom.size[0] * dir
-    return sp
+    sp.point = geom.pos + geom.size[0] * dir
 
   local_dir = wp.transpose(geom.rot) @ dir
   if geomtype == GeomType.BOX:
