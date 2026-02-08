@@ -24,10 +24,157 @@ from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import State
 from mujoco_warp._src.types import vec5
+from mujoco_warp._src.types import vec10
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False})
+
+_EMPTY_MASK = None
+
+
+def _get_empty_mask():
+  global _EMPTY_MASK
+  if _EMPTY_MASK is None:
+    _EMPTY_MASK = wp.empty(0, dtype=bool)
+  return _EMPTY_MASK
+
+
+def mask_args(mask):
+  """Return (use_mask, mask_array) for kernel launches."""
+  use_mask = mask is not None
+  mask_array = mask if mask is not None else _get_empty_mask()
+  return use_mask, mask_array
+
+
+@cache_kernel
+def masked_zero_2d(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array2d(dtype=float),
+  ):
+    worldid, i = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid, i] = 0.0
+
+  return kernel
+
+
+@cache_kernel
+def masked_zero_3d(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array3d(dtype=float),
+  ):
+    worldid, i, j = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid, i, j] = 0.0
+
+  return kernel
+
+
+@cache_kernel
+def masked_copy_2d(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    dst: wp.array2d(dtype=float),
+    src: wp.array2d(dtype=float),
+  ):
+    worldid, i = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    dst[worldid, i] = src[worldid, i]
+
+  return kernel
+
+
+@cache_kernel
+def masked_copy_vec10(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    dst: wp.array2d(dtype=vec10),
+    src: wp.array2d(dtype=vec10),
+  ):
+    worldid, i = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    dst[worldid, i] = src[worldid, i]
+
+  return kernel
+
+
+@cache_kernel
+def masked_zero_spatial_vector(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array2d(dtype=wp.spatial_vector),
+  ):
+    worldid, i = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid, i] = wp.spatial_vector()
+
+  return kernel
+
+
+@cache_kernel
+def masked_zero_vec2(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array(dtype=wp.vec2),
+  ):
+    worldid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid] = wp.vec2()
+
+  return kernel
+
+
+@cache_kernel
+def masked_zero_1d(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array(dtype=float),
+  ):
+    worldid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid] = 0.0
+
+  return kernel
+
+
+@cache_kernel
+def masked_zero_vec3_2d(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    arr: wp.array2d(dtype=wp.vec3),
+  ):
+    worldid, i = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    arr[worldid, i] = wp.vec3()
+
+  return kernel
 
 
 @cache_kernel

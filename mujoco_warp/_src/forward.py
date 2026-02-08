@@ -25,7 +25,9 @@ from mujoco_warp._src import passive
 from mujoco_warp._src import sensor
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.support import mask_args
 from mujoco_warp._src.support import xfrc_accumulate
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import BiasType
@@ -497,34 +499,38 @@ def implicit(m: Model, d: Data):
 
 
 @event_scope
-def fwd_position(m: Model, d: Data, factorize: bool = True):
+def fwd_position(m: Model, d: Data, factorize: bool = True, mask=None):
   """Position-dependent computations.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize interia matrix.
+    mask: Optional per-world boolean mask. True means compute, False means skip.
   """
-  smooth.kinematics(m, d)
-  smooth.com_pos(m, d)
-  smooth.camlight(m, d)
-  smooth.flex(m, d)
-  smooth.tendon(m, d)
-  smooth.crb(m, d)
-  smooth.tendon_armature(m, d)
+  use_mask, mask = mask_args(mask)
+
+  smooth.kinematics(m, d, mask=mask)
+  smooth.com_pos(m, d, mask=mask)
+  smooth.camlight(m, d, mask=mask)
+  smooth.flex(m, d, mask=mask)
+  smooth.tendon(m, d, mask=mask)
+  smooth.crb(m, d, mask=mask)
+  smooth.tendon_armature(m, d, mask=mask)
   if factorize:
-    smooth.factor_m(m, d)
+    smooth.factor_m(m, d, mask=mask)
   if m.opt.run_collision_detection:
     collision_driver.collision(m, d)
   constraint.make_constraint(m, d)
-  smooth.transmission(m, d)
+  smooth.transmission(m, d, mask=mask)
 
 
 # TODO(team): sparse actuator_moment version
 @cache_kernel
-def _actuator_velocity(nv: int):
+def _actuator_velocity(nv: int, use_mask: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def actuator_velocity(
+    mask_in: wp.array(dtype=bool),
     # Data in:
     qvel_in: wp.array2d(dtype=float),
     actuator_moment_in: wp.array3d(dtype=float),
@@ -532,6 +538,9 @@ def _actuator_velocity(nv: int):
     actuator_velocity_out: wp.array2d(dtype=float),
   ):
     worldid, actid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
     moment_tile = wp.tile_load(actuator_moment_in[worldid, actid], shape=wp.static(nv))
     qvel_tile = wp.tile_load(qvel_in[worldid], shape=wp.static(nv))
     moment_qvel_tile = wp.tile_map(wp.mul, moment_tile, qvel_tile)
@@ -542,9 +551,10 @@ def _actuator_velocity(nv: int):
 
 
 @cache_kernel
-def _tendon_velocity(nv: int):
+def _tendon_velocity(nv: int, use_mask: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def tendon_velocity(
+    mask_in: wp.array(dtype=bool),
     # Data in:
     qvel_in: wp.array2d(dtype=float),
     ten_J_in: wp.array3d(dtype=float),
@@ -552,6 +562,9 @@ def _tendon_velocity(nv: int):
     ten_velocity_out: wp.array2d(dtype=float),
   ):
     worldid, tenid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
     ten_J_tile = wp.tile_load(ten_J_in[worldid, tenid], shape=wp.static(nv))
     qvel_tile = wp.tile_load(qvel_in[worldid], shape=wp.static(nv))
     ten_J_qvel_tile = wp.tile_map(wp.mul, ten_J_tile, qvel_tile)
@@ -562,241 +575,292 @@ def _tendon_velocity(nv: int):
 
 
 @event_scope
-def fwd_velocity(m: Model, d: Data):
+def fwd_velocity(m: Model, d: Data, mask=None):
   """Velocity-dependent computations."""
+  use_mask, mask = mask_args(mask)
+
   wp.launch_tiled(
-    _actuator_velocity(m.nv),
+    _actuator_velocity(m.nv, use_mask),
     dim=(d.nworld, m.nu),
-    inputs=[d.qvel, d.actuator_moment],
+    inputs=[mask, d.qvel, d.actuator_moment],
     outputs=[d.actuator_velocity],
     block_dim=m.block_dim.actuator_velocity,
   )
 
   # TODO(team): sparse version
   wp.launch_tiled(
-    _tendon_velocity(m.nv),
+    _tendon_velocity(m.nv, use_mask),
     dim=(d.nworld, m.ntendon),
-    inputs=[d.qvel, d.ten_J],
+    inputs=[mask, d.qvel, d.ten_J],
     outputs=[d.ten_velocity],
     block_dim=m.block_dim.tendon_velocity,
   )
 
-  smooth.com_vel(m, d)
-  passive.passive(m, d)
-  smooth.rne(m, d)
-  smooth.tendon_bias(m, d, d.qfrc_bias)
+  smooth.com_vel(m, d, mask=mask)
+  passive.passive(m, d, mask=mask)
+  smooth.rne(m, d, mask=mask)
+  smooth.tendon_bias(m, d, d.qfrc_bias, mask=mask)
 
 
-@wp.kernel
-def _actuator_force(
-  # Model:
-  na: int,
-  opt_timestep: wp.array(dtype=float),
-  actuator_dyntype: wp.array(dtype=int),
-  actuator_gaintype: wp.array(dtype=int),
-  actuator_biastype: wp.array(dtype=int),
-  actuator_actadr: wp.array(dtype=int),
-  actuator_actnum: wp.array(dtype=int),
-  actuator_ctrllimited: wp.array(dtype=bool),
-  actuator_forcelimited: wp.array(dtype=bool),
-  actuator_actlimited: wp.array(dtype=bool),
-  actuator_dynprm: wp.array2d(dtype=vec10f),
-  actuator_gainprm: wp.array2d(dtype=vec10f),
-  actuator_biasprm: wp.array2d(dtype=vec10f),
-  actuator_actearly: wp.array(dtype=bool),
-  actuator_ctrlrange: wp.array2d(dtype=wp.vec2),
-  actuator_forcerange: wp.array2d(dtype=wp.vec2),
-  actuator_actrange: wp.array2d(dtype=wp.vec2),
-  actuator_acc0: wp.array(dtype=float),
-  actuator_lengthrange: wp.array(dtype=wp.vec2),
-  # Data in:
-  act_in: wp.array2d(dtype=float),
-  ctrl_in: wp.array2d(dtype=float),
-  actuator_length_in: wp.array2d(dtype=float),
-  actuator_velocity_in: wp.array2d(dtype=float),
-  # In:
-  dsbl_clampctrl: int,
-  # Data out:
-  act_dot_out: wp.array2d(dtype=float),
-  actuator_force_out: wp.array2d(dtype=float),
-):
-  worldid, uid = wp.tid()
+@cache_kernel
+def _actuator_force(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    # Model:
+    na: int,
+    opt_timestep: wp.array(dtype=float),
+    actuator_dyntype: wp.array(dtype=int),
+    actuator_gaintype: wp.array(dtype=int),
+    actuator_biastype: wp.array(dtype=int),
+    actuator_actadr: wp.array(dtype=int),
+    actuator_actnum: wp.array(dtype=int),
+    actuator_ctrllimited: wp.array(dtype=bool),
+    actuator_forcelimited: wp.array(dtype=bool),
+    actuator_actlimited: wp.array(dtype=bool),
+    actuator_dynprm: wp.array2d(dtype=vec10f),
+    actuator_gainprm: wp.array2d(dtype=vec10f),
+    actuator_biasprm: wp.array2d(dtype=vec10f),
+    actuator_actearly: wp.array(dtype=bool),
+    actuator_ctrlrange: wp.array2d(dtype=wp.vec2),
+    actuator_forcerange: wp.array2d(dtype=wp.vec2),
+    actuator_actrange: wp.array2d(dtype=wp.vec2),
+    actuator_acc0: wp.array(dtype=float),
+    actuator_lengthrange: wp.array(dtype=wp.vec2),
+    # Data in:
+    act_in: wp.array2d(dtype=float),
+    ctrl_in: wp.array2d(dtype=float),
+    actuator_length_in: wp.array2d(dtype=float),
+    actuator_velocity_in: wp.array2d(dtype=float),
+    # In:
+    dsbl_clampctrl: int,
+    # Data out:
+    act_dot_out: wp.array2d(dtype=float),
+    actuator_force_out: wp.array2d(dtype=float),
+  ):
+    worldid, uid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
 
-  actuator_ctrlrange_id = worldid % actuator_ctrlrange.shape[0]
+    actuator_ctrlrange_id = worldid % actuator_ctrlrange.shape[0]
 
-  ctrl = ctrl_in[worldid, uid]
+    ctrl = ctrl_in[worldid, uid]
 
-  if actuator_ctrllimited[uid] and not dsbl_clampctrl:
-    ctrlrange = actuator_ctrlrange[actuator_ctrlrange_id, uid]
-    ctrl = wp.clamp(ctrl, ctrlrange[0], ctrlrange[1])
-  ctrl_act = ctrl
+    if actuator_ctrllimited[uid] and not dsbl_clampctrl:
+      ctrlrange = actuator_ctrlrange[actuator_ctrlrange_id, uid]
+      ctrl = wp.clamp(ctrl, ctrlrange[0], ctrlrange[1])
+    ctrl_act = ctrl
 
-  act_first = actuator_actadr[uid]
-  if na and act_first >= 0:
-    act_last = act_first + actuator_actnum[uid] - 1
-    dyntype = actuator_dyntype[uid]
-    dynprm = actuator_dynprm[worldid % actuator_dynprm.shape[0], uid]
+    act_first = actuator_actadr[uid]
+    if na and act_first >= 0:
+      act_last = act_first + actuator_actnum[uid] - 1
+      dyntype = actuator_dyntype[uid]
+      dynprm = actuator_dynprm[worldid % actuator_dynprm.shape[0], uid]
 
-    if dyntype == DynType.INTEGRATOR:
-      act_dot = ctrl
-    elif dyntype == DynType.FILTER or dyntype == DynType.FILTEREXACT:
-      act = act_in[worldid, act_last]
-      act_dot = (ctrl - act) / wp.max(dynprm[0], MJ_MINVAL)
-    elif dyntype == DynType.MUSCLE:
-      dynprm = actuator_dynprm[worldid, uid]
-      act = act_in[worldid, act_last]
-      act_dot = util_misc.muscle_dynamics(ctrl, act, dynprm)
-    else:  # DynType.NONE
-      act_dot = 0.0
-
-    act_dot_out[worldid, act_last] = act_dot
-
-    if actuator_actearly[uid]:
-      if dyntype == DynType.INTEGRATOR or dyntype == DynType.NONE:
+      if dyntype == DynType.INTEGRATOR:
+        act_dot = ctrl
+      elif dyntype == DynType.FILTER or dyntype == DynType.FILTEREXACT:
         act = act_in[worldid, act_last]
+        act_dot = (ctrl - act) / wp.max(dynprm[0], MJ_MINVAL)
+      elif dyntype == DynType.MUSCLE:
+        dynprm = actuator_dynprm[worldid, uid]
+        act = act_in[worldid, act_last]
+        act_dot = util_misc.muscle_dynamics(ctrl, act, dynprm)
+      else:  # DynType.NONE
+        act_dot = 0.0
 
-      ctrl_act = _next_act(
-        opt_timestep[worldid % opt_timestep.shape[0]],
-        dyntype,
-        dynprm,
-        actuator_actrange[worldid % actuator_actrange.shape[0], uid],
-        act,
-        act_dot,
-        1.0,
-        actuator_actlimited[uid],
-      )
-    else:
-      ctrl_act = act_in[worldid, act_last]
+      act_dot_out[worldid, act_last] = act_dot
 
-  length = actuator_length_in[worldid, uid]
-  velocity = actuator_velocity_in[worldid, uid]
+      if actuator_actearly[uid]:
+        if dyntype == DynType.INTEGRATOR or dyntype == DynType.NONE:
+          act = act_in[worldid, act_last]
 
-  # gain
-  gaintype = actuator_gaintype[uid]
-  gainprm = actuator_gainprm[worldid % actuator_gainprm.shape[0], uid]
+        ctrl_act = _next_act(
+          opt_timestep[worldid % opt_timestep.shape[0]],
+          dyntype,
+          dynprm,
+          actuator_actrange[worldid % actuator_actrange.shape[0], uid],
+          act,
+          act_dot,
+          1.0,
+          actuator_actlimited[uid],
+        )
+      else:
+        ctrl_act = act_in[worldid, act_last]
 
-  gain = 0.0
-  if gaintype == GainType.FIXED:
-    gain = gainprm[0]
-  elif gaintype == GainType.AFFINE:
-    gain = gainprm[0] + gainprm[1] * length + gainprm[2] * velocity
-  elif gaintype == GainType.MUSCLE:
-    acc0 = actuator_acc0[uid]
-    lengthrange = actuator_lengthrange[uid]
-    gain = util_misc.muscle_gain(length, velocity, lengthrange, acc0, gainprm)
+    length = actuator_length_in[worldid, uid]
+    velocity = actuator_velocity_in[worldid, uid]
 
-  # bias
-  biastype = actuator_biastype[uid]
-  biasprm = actuator_biasprm[worldid % actuator_biasprm.shape[0], uid]
+    # gain
+    gaintype = actuator_gaintype[uid]
+    gainprm = actuator_gainprm[worldid % actuator_gainprm.shape[0], uid]
 
-  bias = 0.0  # BiasType.NONE
-  if biastype == BiasType.AFFINE:
-    bias = biasprm[0] + biasprm[1] * length + biasprm[2] * velocity
-  elif biastype == BiasType.MUSCLE:
-    acc0 = actuator_acc0[uid]
-    lengthrange = actuator_lengthrange[uid]
-    bias = util_misc.muscle_bias(length, lengthrange, acc0, biasprm)
+    gain = 0.0
+    if gaintype == GainType.FIXED:
+      gain = gainprm[0]
+    elif gaintype == GainType.AFFINE:
+      gain = gainprm[0] + gainprm[1] * length + gainprm[2] * velocity
+    elif gaintype == GainType.MUSCLE:
+      acc0 = actuator_acc0[uid]
+      lengthrange = actuator_lengthrange[uid]
+      gain = util_misc.muscle_gain(length, velocity, lengthrange, acc0, gainprm)
 
-  force = gain * ctrl_act + bias
+    # bias
+    biastype = actuator_biastype[uid]
+    biasprm = actuator_biasprm[worldid % actuator_biasprm.shape[0], uid]
 
-  if actuator_forcelimited[uid]:
-    forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], uid]
-    force = wp.clamp(force, forcerange[0], forcerange[1])
+    bias = 0.0  # BiasType.NONE
+    if biastype == BiasType.AFFINE:
+      bias = biasprm[0] + biasprm[1] * length + biasprm[2] * velocity
+    elif biastype == BiasType.MUSCLE:
+      acc0 = actuator_acc0[uid]
+      lengthrange = actuator_lengthrange[uid]
+      bias = util_misc.muscle_bias(length, lengthrange, acc0, biasprm)
 
-  actuator_force_out[worldid, uid] = force
+    force = gain * ctrl_act + bias
 
+    if actuator_forcelimited[uid]:
+      forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], uid]
+      force = wp.clamp(force, forcerange[0], forcerange[1])
 
-@wp.kernel
-def _tendon_actuator_force(
-  # Model:
-  actuator_trntype: wp.array(dtype=int),
-  actuator_trnid: wp.array(dtype=wp.vec2i),
-  # Data in:
-  actuator_force_in: wp.array2d(dtype=float),
-  # Out:
-  ten_actfrc_out: wp.array2d(dtype=float),
-):
-  worldid, actid = wp.tid()
+    actuator_force_out[worldid, uid] = force
 
-  if actuator_trntype[actid] == TrnType.TENDON:
-    tenid = actuator_trnid[actid][0]
-    # TODO(team): only compute for tendons with force limits?
-    wp.atomic_add(ten_actfrc_out[worldid], tenid, actuator_force_in[worldid, actid])
+  return kernel
 
 
-@wp.kernel
-def _tendon_actuator_force_clamp(
-  # Model:
-  tendon_actfrclimited: wp.array(dtype=bool),
-  tendon_actfrcrange: wp.array2d(dtype=wp.vec2),
-  actuator_trntype: wp.array(dtype=int),
-  actuator_trnid: wp.array(dtype=wp.vec2i),
-  # In:
-  ten_actfrc_in: wp.array2d(dtype=float),
-  # Data out:
-  actuator_force_out: wp.array2d(dtype=float),
-):
-  worldid, actid = wp.tid()
+@cache_kernel
+def _tendon_actuator_force(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    # Model:
+    actuator_trntype: wp.array(dtype=int),
+    actuator_trnid: wp.array(dtype=wp.vec2i),
+    # Data in:
+    actuator_force_in: wp.array2d(dtype=float),
+    # Out:
+    ten_actfrc_out: wp.array2d(dtype=float),
+  ):
+    worldid, actid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
 
-  if actuator_trntype[actid] == TrnType.TENDON:
-    tenid = actuator_trnid[actid][0]
-    if tendon_actfrclimited[tenid]:
-      ten_actfrc = ten_actfrc_in[worldid, tenid]
-      actfrcrange = tendon_actfrcrange[worldid % tendon_actfrcrange.shape[0], tenid]
+    if actuator_trntype[actid] == TrnType.TENDON:
+      tenid = actuator_trnid[actid][0]
+      # TODO(team): only compute for tendons with force limits?
+      wp.atomic_add(ten_actfrc_out[worldid], tenid, actuator_force_in[worldid, actid])
 
-      if ten_actfrc < actfrcrange[0]:
-        actuator_force_out[worldid, actid] *= actfrcrange[0] / ten_actfrc
-      elif ten_actfrc > actfrcrange[1]:
-        actuator_force_out[worldid, actid] *= actfrcrange[1] / ten_actfrc
+  return kernel
 
 
-@wp.kernel
-def _qfrc_actuator(
-  # Model:
-  nu: int,
-  ngravcomp: int,
-  jnt_actfrclimited: wp.array(dtype=bool),
-  jnt_actgravcomp: wp.array(dtype=int),
-  jnt_actfrcrange: wp.array2d(dtype=wp.vec2),
-  dof_jntid: wp.array(dtype=int),
-  # Data in:
-  actuator_moment_in: wp.array3d(dtype=float),
-  qfrc_gravcomp_in: wp.array2d(dtype=float),
-  actuator_force_in: wp.array2d(dtype=float),
-  # Data out:
-  qfrc_actuator_out: wp.array2d(dtype=float),
-):
-  worldid, dofid = wp.tid()
+@cache_kernel
+def _tendon_actuator_force_clamp(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    # Model:
+    tendon_actfrclimited: wp.array(dtype=bool),
+    tendon_actfrcrange: wp.array2d(dtype=wp.vec2),
+    actuator_trntype: wp.array(dtype=int),
+    actuator_trnid: wp.array(dtype=wp.vec2i),
+    # In:
+    ten_actfrc_in: wp.array2d(dtype=float),
+    # Data out:
+    actuator_force_out: wp.array2d(dtype=float),
+  ):
+    worldid, actid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
 
-  qfrc = float(0.0)
-  for uid in range(nu):
-    qfrc += actuator_moment_in[worldid, uid, dofid] * actuator_force_in[worldid, uid]
+    if actuator_trntype[actid] == TrnType.TENDON:
+      tenid = actuator_trnid[actid][0]
+      if tendon_actfrclimited[tenid]:
+        ten_actfrc = ten_actfrc_in[worldid, tenid]
+        actfrcrange = tendon_actfrcrange[worldid % tendon_actfrcrange.shape[0], tenid]
 
-  jntid = dof_jntid[dofid]
+        if ten_actfrc < actfrcrange[0]:
+          actuator_force_out[worldid, actid] *= actfrcrange[0] / ten_actfrc
+        elif ten_actfrc > actfrcrange[1]:
+          actuator_force_out[worldid, actid] *= actfrcrange[1] / ten_actfrc
 
-  # actuator-level gravity compensation, skip if added as passive force
-  if ngravcomp and jnt_actgravcomp[jntid]:
-    qfrc += qfrc_gravcomp_in[worldid, dofid]
+  return kernel
 
-  if jnt_actfrclimited[jntid]:
-    frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], jntid]
-    qfrc = wp.clamp(qfrc, frcrange[0], frcrange[1])
 
-  qfrc_actuator_out[worldid, dofid] = qfrc
+@cache_kernel
+def _qfrc_actuator(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    # Model:
+    nu: int,
+    ngravcomp: int,
+    jnt_actfrclimited: wp.array(dtype=bool),
+    jnt_actgravcomp: wp.array(dtype=int),
+    jnt_actfrcrange: wp.array2d(dtype=wp.vec2),
+    dof_jntid: wp.array(dtype=int),
+    # Data in:
+    actuator_moment_in: wp.array3d(dtype=float),
+    qfrc_gravcomp_in: wp.array2d(dtype=float),
+    actuator_force_in: wp.array2d(dtype=float),
+    # Data out:
+    qfrc_actuator_out: wp.array2d(dtype=float),
+  ):
+    worldid, dofid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+
+    qfrc = float(0.0)
+    for uid in range(nu):
+      qfrc += actuator_moment_in[worldid, uid, dofid] * actuator_force_in[worldid, uid]
+
+    jntid = dof_jntid[dofid]
+
+    # actuator-level gravity compensation, skip if added as passive force
+    if ngravcomp and jnt_actgravcomp[jntid]:
+      qfrc += qfrc_gravcomp_in[worldid, dofid]
+
+    if jnt_actfrclimited[jntid]:
+      frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], jntid]
+      qfrc = wp.clamp(qfrc, frcrange[0], frcrange[1])
+
+    qfrc_actuator_out[worldid, dofid] = qfrc
+
+  return kernel
 
 
 @event_scope
-def fwd_actuation(m: Model, d: Data):
+def fwd_actuation(m: Model, d: Data, mask=None):
   """Actuation-dependent computations."""
+  use_mask, mask = mask_args(mask)
+
   if not m.nu or (m.opt.disableflags & DisableBit.ACTUATION):
-    d.act_dot.zero_()
-    d.qfrc_actuator.zero_()
+    if use_mask:
+      wp.launch(
+        support.masked_zero_2d(True),
+        dim=d.act_dot.shape,
+        inputs=[mask],
+        outputs=[d.act_dot],
+      )
+      wp.launch(
+        support.masked_zero_2d(True),
+        dim=d.qfrc_actuator.shape,
+        inputs=[mask],
+        outputs=[d.qfrc_actuator],
+      )
+    else:
+      d.act_dot.zero_()
+      d.qfrc_actuator.zero_()
     return
 
   wp.launch(
-    _actuator_force,
+    _actuator_force(use_mask),
     dim=(d.nworld, m.nu),
     inputs=[
+      mask,
       m.na,
       m.opt.timestep,
       m.actuator_dyntype,
@@ -829,23 +893,24 @@ def fwd_actuation(m: Model, d: Data):
     # total actuator force at tendon
     ten_actfrc = wp.zeros((d.nworld, m.ntendon), dtype=float)
     wp.launch(
-      _tendon_actuator_force,
+      _tendon_actuator_force(use_mask),
       dim=(d.nworld, m.nu),
-      inputs=[m.actuator_trntype, m.actuator_trnid, d.actuator_force],
+      inputs=[mask, m.actuator_trntype, m.actuator_trnid, d.actuator_force],
       outputs=[ten_actfrc],
     )
 
     wp.launch(
-      _tendon_actuator_force_clamp,
+      _tendon_actuator_force_clamp(use_mask),
       dim=(d.nworld, m.nu),
-      inputs=[m.tendon_actfrclimited, m.tendon_actfrcrange, m.actuator_trntype, m.actuator_trnid, ten_actfrc],
+      inputs=[mask, m.tendon_actfrclimited, m.tendon_actfrcrange, m.actuator_trntype, m.actuator_trnid, ten_actfrc],
       outputs=[d.actuator_force],
     )
 
   wp.launch(
-    _qfrc_actuator,
+    _qfrc_actuator(use_mask),
     dim=(d.nworld, m.nv),
     inputs=[
+      mask,
       m.nu,
       m.ngravcomp,
       m.jnt_actfrclimited,
@@ -860,74 +925,102 @@ def fwd_actuation(m: Model, d: Data):
   )
 
 
-@wp.kernel
-def _qfrc_smooth(
-  # Data in:
-  qfrc_applied_in: wp.array2d(dtype=float),
-  qfrc_bias_in: wp.array2d(dtype=float),
-  qfrc_passive_in: wp.array2d(dtype=float),
-  qfrc_actuator_in: wp.array2d(dtype=float),
-  # Data out:
-  qfrc_smooth_out: wp.array2d(dtype=float),
-):
-  worldid, dofid = wp.tid()
-  qfrc_smooth_out[worldid, dofid] = (
-    qfrc_passive_in[worldid, dofid]
-    - qfrc_bias_in[worldid, dofid]
-    + qfrc_actuator_in[worldid, dofid]
-    + qfrc_applied_in[worldid, dofid]
-  )
+@cache_kernel
+def _qfrc_smooth(use_mask: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    mask_in: wp.array(dtype=bool),
+    # Data in:
+    qfrc_applied_in: wp.array2d(dtype=float),
+    qfrc_bias_in: wp.array2d(dtype=float),
+    qfrc_passive_in: wp.array2d(dtype=float),
+    qfrc_actuator_in: wp.array2d(dtype=float),
+    # Data out:
+    qfrc_smooth_out: wp.array2d(dtype=float),
+  ):
+    worldid, dofid = wp.tid()
+    if wp.static(use_mask):
+      if not mask_in[worldid]:
+        return
+    qfrc_smooth_out[worldid, dofid] = (
+      qfrc_passive_in[worldid, dofid]
+      - qfrc_bias_in[worldid, dofid]
+      + qfrc_actuator_in[worldid, dofid]
+      + qfrc_applied_in[worldid, dofid]
+    )
+
+  return kernel
 
 
 @event_scope
-def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
+def fwd_acceleration(m: Model, d: Data, factorize: bool = False, mask=None):
   """Add up all non-constraint forces, compute qacc_smooth.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
+    mask: Optional per-world boolean mask. True means compute, False means skip.
   """
+  use_mask, mask = mask_args(mask)
+
   wp.launch(
-    _qfrc_smooth,
+    _qfrc_smooth(use_mask),
     dim=(d.nworld, m.nv),
-    inputs=[d.qfrc_applied, d.qfrc_bias, d.qfrc_passive, d.qfrc_actuator],
+    inputs=[mask, d.qfrc_applied, d.qfrc_bias, d.qfrc_passive, d.qfrc_actuator],
     outputs=[d.qfrc_smooth],
   )
   xfrc_accumulate(m, d, d.qfrc_smooth)
 
   if factorize:
-    smooth.factor_solve_i(m, d, d.qM, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth)
+    smooth.factor_solve_i(m, d, d.qM, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth, mask=mask)
   else:
-    smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
+    smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth, mask=mask)
 
 
 @event_scope
-def forward(m: Model, d: Data):
+def forward(m: Model, d: Data, mask=None):
   """Forward dynamics."""
+  use_mask, mask = mask_args(mask)
   energy = m.opt.enableflags & EnableBit.ENERGY
 
-  fwd_position(m, d, factorize=False)
-  d.sensordata.zero_()
-  sensor.sensor_pos(m, d)
+  fwd_position(m, d, factorize=False, mask=mask)
+  if use_mask:
+    wp.launch(
+      support.masked_zero_2d(True),
+      dim=d.sensordata.shape,
+      inputs=[mask],
+      outputs=[d.sensordata],
+    )
+  else:
+    d.sensordata.zero_()
+  sensor.sensor_pos(m, d, mask=mask)
   if energy:
     if m.sensor_e_potential == 0:  # not computed by sensor
-      sensor.energy_pos(m, d)
+      sensor.energy_pos(m, d, mask=mask)
   else:
-    d.energy.zero_()
+    if use_mask:
+      wp.launch(
+        support.masked_zero_vec2(True),
+        dim=(d.energy.shape[0],),
+        inputs=[mask],
+        outputs=[d.energy],
+      )
+    else:
+      d.energy.zero_()
 
-  fwd_velocity(m, d)
-  sensor.sensor_vel(m, d)
+  fwd_velocity(m, d, mask=mask)
+  sensor.sensor_vel(m, d, mask=mask)
 
   if energy:
     if m.sensor_e_kinetic == 0:  # not computed by sensor
-      sensor.energy_vel(m, d)
+      sensor.energy_vel(m, d, mask=mask)
 
-  fwd_actuation(m, d)
-  fwd_acceleration(m, d, factorize=True)
+  fwd_actuation(m, d, mask=mask)
+  fwd_acceleration(m, d, factorize=True, mask=mask)
 
   solver.solve(m, d)
-  sensor.sensor_acc(m, d)
+  sensor.sensor_acc(m, d, mask=mask)
 
 
 @event_scope
