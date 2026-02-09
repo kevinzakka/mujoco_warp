@@ -268,6 +268,65 @@ class ForwardTest(parameterized.TestCase):
     _assert_eq(d.qpos.numpy()[0], mjd.qpos, "qpos")
     _assert_eq(d.qvel.numpy()[0], mjd.qvel, "qvel")
 
+  def test_implicit_forcerange_kv(self):
+    """When actuator force is clipped by forcerange, implicit kv damping should be zero."""
+    xml = """
+    <mujoco>
+      <option integrator="implicitfast">
+        <flag gravity="disable" contact="disable"/>
+      </option>
+      <worldbody>
+        <body>
+          <joint name="slide" type="slide" axis="0 0 1"/>
+          <geom type="sphere" size="0.1" mass="1"/>
+        </body>
+      </worldbody>
+      <actuator>
+        <general joint="slide" gaintype="affine" gainprm="0 0 10"
+                 forcelimited="true" forcerange="-1 1"/>
+      </actuator>
+    </mujoco>
+    """
+    # Gain is purely kv=10, so force = 10*velocity*ctrl.
+    # With ctrl=1, velocity=1: force = 10, clamped to 1.
+    # Since clamped, df/dv = 0 -> no implicit damping.
+
+    # Model WITH kv and forcerange (force will be clipped)
+    mjm, mjd, m, d = test_data.fixture(xml=xml)
+    mjd.qvel[0] = 1.0
+    mjd.ctrl[0] = 1.0
+    mujoco.mj_forward(mjm, mjd)
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    d.efc.Ma = wp.array(
+      mjd.qfrc_constraint + mjd.qfrc_smooth,
+      dtype=wp.float32,
+      shape=(1, -1),
+    )
+    mjw.fwd_actuation(m, d)  # populates actuator_force_clipped
+    mjw.implicit(m, d)
+    qvel_with_kv = d.qvel.numpy()[0].copy()
+
+    # Model WITHOUT kv (baseline -- no velocity damping at all)
+    xml_no_kv = xml.replace('gainprm="0 0 10"', 'gainprm="0 0 0"')
+    mjm2, mjd2, m2, d2 = test_data.fixture(xml=xml_no_kv)
+    mjd2.qvel[0] = 1.0
+    mjd2.ctrl[0] = 1.0
+    mujoco.mj_forward(mjm2, mjd2)
+    m2 = mjw.put_model(mjm2)
+    d2 = mjw.put_data(mjm2, mjd2)
+    d2.efc.Ma = wp.array(
+      mjd2.qfrc_constraint + mjd2.qfrc_smooth,
+      dtype=wp.float32,
+      shape=(1, -1),
+    )
+    mjw.fwd_actuation(m2, d2)  # populates actuator_force_clipped
+    mjw.implicit(m2, d2)
+    qvel_no_kv = d2.qvel.numpy()[0].copy()
+
+    # When force is clipped, kv should have no effect on implicit integration
+    _assert_eq(qvel_with_kv, qvel_no_kv, "qvel: clipped kv should equal no kv")
+
   @absltest.skipIf(not wp.get_device().is_cuda, "Skipping test that requires GPU.")
   @parameterized.product(
     xml=("humanoid/humanoid.xml", "pendula.xml", "constraints.xml", "collision.xml"), graph_conditional=(True, False)

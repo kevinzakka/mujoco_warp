@@ -42,6 +42,7 @@ def _qderiv_actuator_passive_vel(
   # Data in:
   act_in: wp.array2d(dtype=float),
   ctrl_in: wp.array2d(dtype=float),
+  actuator_force_clipped_in: wp.array2d(dtype=bool),
   # Out:
   vel_out: wp.array2d(dtype=float),
 ):
@@ -73,6 +74,9 @@ def _qderiv_actuator_passive_vel(
   else:
     if gain != 0.0:
       vel += gain * ctrl_in[worldid, actid]
+
+  if actuator_force_clipped_in[worldid, actid]:
+    vel = 0.0
 
   vel_out[worldid, actid] = vel
 
@@ -241,6 +245,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d(dtype=float)):
           m.actuator_biasprm,
           d.act,
           d.ctrl,
+          d.actuator_force_clipped,
         ],
         outputs=[vel],
       )

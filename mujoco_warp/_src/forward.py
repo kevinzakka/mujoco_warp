@@ -619,6 +619,7 @@ def _actuator_force(
   # Data out:
   act_dot_out: wp.array2d(dtype=float),
   actuator_force_out: wp.array2d(dtype=float),
+  actuator_force_clipped_out: wp.array2d(dtype=bool),
 ):
   worldid, uid = wp.tid()
 
@@ -699,10 +700,14 @@ def _actuator_force(
 
   force = gain * ctrl_act + bias
 
+  clipped = False
   if actuator_forcelimited[uid]:
     forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], uid]
-    force = wp.clamp(force, forcerange[0], forcerange[1])
+    clamped = wp.clamp(force, forcerange[0], forcerange[1])
+    clipped = clamped != force
+    force = clamped
 
+  actuator_force_clipped_out[worldid, uid] = clipped
   actuator_force_out[worldid, uid] = force
 
 
@@ -822,7 +827,7 @@ def fwd_actuation(m: Model, d: Data):
       d.actuator_velocity,
       m.opt.disableflags & DisableBit.CLAMPCTRL,
     ],
-    outputs=[d.act_dot, d.actuator_force],
+    outputs=[d.act_dot, d.actuator_force, d.actuator_force_clipped],
   )
 
   if m.ntendon:
