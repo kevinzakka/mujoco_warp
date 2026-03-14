@@ -47,9 +47,15 @@ from mujoco_warp._src.forward import rungekutta4 as rungekutta4
 from mujoco_warp._src.forward import step1 as step1
 from mujoco_warp._src.forward import step2 as step2
 from mujoco_warp._src.inverse import inverse as inverse
+from mujoco_warp._src.io import HeterogeneousAssetPlan as HeterogeneousAssetPlan
+from mujoco_warp._src.io import HeterogeneousAssetRuntime as HeterogeneousAssetRuntime
+from mujoco_warp._src.io import HeterogeneousRecompute as HeterogeneousRecompute
+from mujoco_warp._src.io import apply_heterogeneous_assignments as apply_heterogeneous_assignments
+from mujoco_warp._src.io import build_heterogeneous_model as build_heterogeneous_model
 from mujoco_warp._src.io import create_render_context as create_render_context
 from mujoco_warp._src.io import get_data_into as get_data_into
 from mujoco_warp._src.io import make_data as make_data
+from mujoco_warp._src.io import plan_heterogeneous_assets_from_tuples as plan_heterogeneous_assets_from_tuples
 from mujoco_warp._src.io import put_data as put_data
 from mujoco_warp._src.io import put_model as put_model
 from mujoco_warp._src.io import reset_data as reset_data

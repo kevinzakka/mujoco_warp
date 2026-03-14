@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import dataclasses
+import enum
 import warnings
 from typing import Any, Optional, Sequence
 
@@ -33,6 +34,469 @@ from mujoco_warp._src.types import BiasType
 from mujoco_warp._src.types import TrnType
 from mujoco_warp._src.types import vec10
 from mujoco_warp._src.util_pkg import check_version
+
+# ---------------------------------------------------------------------------
+# Heterogeneous asset types
+# ---------------------------------------------------------------------------
+
+
+class HeterogeneousRecompute(enum.Enum):
+  """Required recomputation level after heterogeneous assignment changes."""
+
+  NONE = 0
+  SET_CONST_FIXED = 1
+  SET_CONST_0 = 2
+  SET_CONST = 3
+
+
+@dataclasses.dataclass
+class HeterogeneousAssetPlan:
+  """Canonical plan describing per-world mesh variant sets.
+
+  This is the foundational input to ``build_heterogeneous_model``. It is
+  independent of MuJoCo XML tuples and can be constructed programmatically
+  by downstream libraries.
+
+  In v1, ``build_heterogeneous_model`` only supports mesh-backed geom/body
+  variants. Heightfield variants remain future work.
+
+  Geom-level sets
+  ~~~~~~~~~~~~~~~
+  For set *i*:
+    - ``geom_ids[i]`` is the geom whose dataid varies across worlds.
+    - ``geom_candidate_dataids[i][j]`` is candidate *j*'s mesh dataid.
+    - ``geom_candidate_weights[i]`` optionally provides sampling weights.
+
+  Body-level sets
+  ~~~~~~~~~~~~~~~
+  For set *i*:
+    - ``body_ids[i]`` is the body whose mesh geom slots vary.
+    - ``body_geom_ids[i]`` gives the fixed slot order (after padding).
+    - ``body_variant_rows[i][j][k]`` is the dataid for variant *j*,
+      slot *k*. Use ``-1`` to disable a slot.
+    - ``body_variant_weights[i]`` optionally provides sampling weights.
+  """
+
+  geom_ids: list[int] = dataclasses.field(default_factory=list)
+  geom_candidate_dataids: list[list[int]] = dataclasses.field(default_factory=list)
+  geom_candidate_weights: list[list[float] | None] = dataclasses.field(default_factory=list)
+
+  body_ids: list[int] = dataclasses.field(default_factory=list)
+  body_geom_ids: list[list[int]] = dataclasses.field(default_factory=list)
+  body_variant_rows: list[list[list[int]]] = dataclasses.field(default_factory=list)
+  body_variant_weights: list[list[float] | None] = dataclasses.field(default_factory=list)
+
+  @property
+  def num_geom_sets(self) -> int:
+    return len(self.geom_ids)
+
+  @property
+  def num_body_sets(self) -> int:
+    return len(self.body_ids)
+
+  @property
+  def num_sets(self) -> int:
+    return self.num_geom_sets + self.num_body_sets
+
+  @property
+  def is_empty(self) -> bool:
+    return self.num_sets == 0
+
+
+class HeterogeneousAssetRuntime:
+  """Opaque runtime object attached to a Model after heterogeneous build.
+
+  Stores the variant cache and metadata needed for reset-time reassignment
+  via ``apply_heterogeneous_assignments``.
+
+  In v1, this runtime is mesh-only. ``candidate_hfield_ids`` is reserved for
+  future heightfield support and is currently always ``None``.
+  ``host_model`` exposes the padded host-side MuJoCo model that matches the
+  heterogeneous Warp model layout.
+  """
+
+  def __init__(
+    self,
+    *,
+    affected_fields: tuple[str, ...],
+    required_recompute: HeterogeneousRecompute,
+    host_model: mujoco.MjModel,
+    candidate_mesh_ids: np.ndarray | None,
+    candidate_hfield_ids: np.ndarray | None,
+    initial_assignment: np.ndarray,
+    real_geom_mask: np.ndarray,
+    plan: HeterogeneousAssetPlan,
+    variant_row_keys: np.ndarray,
+    variant_field_values: dict[str, np.ndarray],
+    dataid_table: np.ndarray,
+  ):
+    self._affected_fields = affected_fields
+    self._required_recompute = required_recompute
+    self._host_model = host_model
+    self._candidate_mesh_ids = candidate_mesh_ids
+    self._candidate_hfield_ids = candidate_hfield_ids
+    self._initial_assignment = initial_assignment
+    self._real_geom_mask = real_geom_mask
+    self._plan = plan
+    self._variant_row_keys = variant_row_keys
+    self._variant_field_values = variant_field_values
+    self._dataid_table = dataid_table
+
+  @property
+  def affected_fields(self) -> tuple[str, ...]:
+    return self._affected_fields
+
+  @property
+  def required_recompute(self) -> HeterogeneousRecompute:
+    return self._required_recompute
+
+  @property
+  def host_model(self) -> mujoco.MjModel:
+    """Padded host MjModel matching the heterogeneous Warp model layout."""
+    return self._host_model
+
+  @property
+  def candidate_mesh_ids(self) -> np.ndarray | None:
+    return self._candidate_mesh_ids
+
+  @property
+  def candidate_hfield_ids(self) -> np.ndarray | None:
+    """Reserved for future heightfield support; currently always ``None``."""
+    return self._candidate_hfield_ids
+
+  @property
+  def initial_assignment(self) -> np.ndarray:
+    return self._initial_assignment
+
+  @property
+  def real_geom_mask(self) -> np.ndarray:
+    return self._real_geom_mask
+
+  @property
+  def num_sets(self) -> int:
+    return self._plan.num_sets
+
+
+def _copy_heterogeneous_plan(
+  plan: HeterogeneousAssetPlan,
+) -> HeterogeneousAssetPlan:
+  """Create an internal deep copy so build-time normalization is non-mutating."""
+  return HeterogeneousAssetPlan(
+    geom_ids=list(plan.geom_ids),
+    geom_candidate_dataids=[list(candidate_row) for candidate_row in plan.geom_candidate_dataids],
+    geom_candidate_weights=[None if weights is None else list(weights) for weights in plan.geom_candidate_weights],
+    body_ids=list(plan.body_ids),
+    body_geom_ids=[list(geom_ids) for geom_ids in plan.body_geom_ids],
+    body_variant_rows=[[list(row) for row in variant_rows] for variant_rows in plan.body_variant_rows],
+    body_variant_weights=[None if weights is None else list(weights) for weights in plan.body_variant_weights],
+  )
+
+
+@wp.kernel
+def _scatter_rows_int_2d(
+  src: wp.array(dtype=int, ndim=2),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=int, ndim=2),
+):
+  world_idx, item_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx] = src[world_idx, item_idx]
+
+
+@wp.kernel
+def _scatter_rows_float_2d(
+  src: wp.array(dtype=float, ndim=2),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=float, ndim=2),
+):
+  world_idx, item_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx] = src[world_idx, item_idx]
+
+
+@wp.kernel
+def _scatter_rows_vec2_2d(
+  src: wp.array(dtype=wp.vec2, ndim=2),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=wp.vec2, ndim=2),
+):
+  world_idx, item_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx] = src[world_idx, item_idx]
+
+
+@wp.kernel
+def _scatter_rows_vec3_2d(
+  src: wp.array(dtype=wp.vec3, ndim=2),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=wp.vec3, ndim=2),
+):
+  world_idx, item_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx] = src[world_idx, item_idx]
+
+
+@wp.kernel
+def _scatter_rows_vec3_3d(
+  src: wp.array(dtype=wp.vec3, ndim=3),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=wp.vec3, ndim=3),
+):
+  world_idx, item_idx, subitem_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx, subitem_idx] = src[world_idx, item_idx, subitem_idx]
+
+
+@wp.kernel
+def _scatter_rows_quat_2d(
+  src: wp.array(dtype=wp.quat, ndim=2),
+  env_ids: wp.array(dtype=int, ndim=1),
+  dst: wp.array(dtype=wp.quat, ndim=2),
+):
+  world_idx, item_idx = wp.tid()
+  dst[env_ids[world_idx], item_idx] = src[world_idx, item_idx]
+
+
+def _scatter_selected_rows_to_field(
+  field_name: str,
+  src: wp.array,
+  env_ids: wp.array,
+  dst: wp.array,
+) -> None:
+  """Scatter selected rows into selected worlds on device."""
+  if field_name == "geom_aabb":
+    wp.launch(
+      _scatter_rows_vec3_3d,
+      dim=(env_ids.shape[0], src.shape[1], src.shape[2]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  elif field_name in ("geom_size", "geom_pos", "body_inertia", "body_ipos"):
+    wp.launch(
+      _scatter_rows_vec3_2d,
+      dim=(env_ids.shape[0], src.shape[1]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  elif field_name == "body_invweight0":
+    wp.launch(
+      _scatter_rows_vec2_2d,
+      dim=(env_ids.shape[0], src.shape[1]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  elif field_name == "body_iquat":
+    wp.launch(
+      _scatter_rows_quat_2d,
+      dim=(env_ids.shape[0], src.shape[1]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  elif field_name in ("geom_rbound", "body_mass", "body_subtreemass"):
+    wp.launch(
+      _scatter_rows_float_2d,
+      dim=(env_ids.shape[0], src.shape[1]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  elif field_name == "geom_dataid":
+    wp.launch(
+      _scatter_rows_int_2d,
+      dim=(env_ids.shape[0], src.shape[1]),
+      inputs=[src, env_ids],
+      outputs=[dst],
+    )
+  else:
+    raise ValueError(f"Unsupported heterogeneous field scatter: {field_name}")
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous asset helpers (private)
+# ---------------------------------------------------------------------------
+
+_DEPENDENT_FIELDS = (
+  "geom_size",
+  "geom_rbound",
+  "geom_aabb",
+  "geom_pos",
+  "body_mass",
+  "body_subtreemass",
+  "body_inertia",
+  "body_invweight0",
+  "body_ipos",
+  "body_iquat",
+)
+
+_DEPENDENT_FIELD_DTYPES = {
+  "geom_size": wp.vec3,
+  "geom_rbound": float,
+  "geom_aabb": wp.vec3,
+  "geom_pos": wp.vec3,
+  "body_mass": float,
+  "body_subtreemass": float,
+  "body_inertia": wp.vec3,
+  "body_invweight0": wp.vec2,
+  "body_ipos": wp.vec3,
+  "body_iquat": wp.quat,
+}
+
+
+def _allocate_worlds(
+  candidates: list[tuple[int, float]],
+  nworld: int,
+) -> list[int]:
+  """Assign worlds using the largest remainder method.
+
+  Returns list of length *nworld* with candidate indices (not mesh IDs).
+  """
+  total_prm = sum(prm for _, prm in candidates)
+  if total_prm <= 0:
+    total_prm = len(candidates)
+    candidates = [(mid, 1.0) for mid, _ in candidates]
+  quotas = [(prm / total_prm) * nworld for _, prm in candidates]
+  floors = [int(q) for q in quotas]
+  remainders = [(quotas[i] - floors[i], i) for i in range(len(candidates))]
+  allocated = sum(floors)
+  remainders.sort(key=lambda x: -x[0])
+  for j in range(nworld - allocated):
+    floors[remainders[j][1]] += 1
+  assignment = []
+  for idx, count in enumerate(floors):
+    assignment.extend([idx] * count)
+  return assignment
+
+
+def _populate_dependent_fields(
+  spec: mujoco.MjSpec,
+  padded_model: mujoco.MjModel,
+  dataid_table: np.ndarray,
+  nworld: int,
+  geom_variants: dict,
+  body_variants: dict,
+) -> dict[str, np.ndarray]:
+  """Compile each unique variant and return per-variant dependent fields.
+
+  Returns a dict mapping field names to numpy arrays of shape
+  ``(n_unique_variants, ...)``, plus a key array mapping dataid rows to
+  variant indices.
+
+  Saves and restores spec state so the spec is not left mutated.
+  """
+  unique_rows = {}
+  for w in range(nworld):
+    key = tuple(dataid_table[w])
+    if key not in unique_rows:
+      unique_rows[key] = w
+
+  # Save spec state
+  spec_geoms = list(spec.geoms)
+  saved_geom_state = {}
+  for idx, g in enumerate(spec_geoms):
+    saved_geom_state[idx] = (g.meshname, g.contype, g.conaffinity, g.mass)
+
+  # Build index map: geom_id (in padded_model) -> spec geom index
+  geom_id_to_spec_idx = {}
+  for idx, g in enumerate(spec_geoms):
+    if g.name:
+      gid = mujoco.mj_name2id(padded_model, mujoco.mjtObj.mjOBJ_GEOM, g.name)
+      if gid >= 0:
+        geom_id_to_spec_idx[gid] = idx
+
+  # For unnamed geoms, match by body and order within body
+  body_geom_order = {}
+  for idx, g in enumerate(spec_geoms):
+    if not g.name and g.type == mujoco.mjtGeom.mjGEOM_MESH:
+      for b in spec.bodies:
+        if any(bg is g for bg in b.geoms):
+          if b.name not in body_geom_order:
+            body_geom_order[b.name] = []
+          body_geom_order[b.name].append(idx)
+          break
+
+  for body_name, spec_indices in body_geom_order.items():
+    body_id = mujoco.mj_name2id(padded_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    unnamed_model_geoms = [
+      gid
+      for gid in range(padded_model.ngeom)
+      if padded_model.geom_bodyid[gid] == body_id
+      and padded_model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+      and mujoco.mj_id2name(padded_model, mujoco.mjtObj.mjOBJ_GEOM, gid) == ""
+    ]
+    for k, spec_idx in enumerate(spec_indices):
+      if k < len(unnamed_model_geoms):
+        geom_id_to_spec_idx[unnamed_model_geoms[k]] = spec_idx
+
+  # Compile each unique variant to get reference field values
+  compiled_variants = {}
+  for key, first_world in unique_rows.items():
+    for geom_id, candidates in geom_variants.items():
+      mesh_id = dataid_table[first_world, geom_id]
+      if mesh_id >= 0 and geom_id in geom_id_to_spec_idx:
+        mesh_name = mujoco.mj_id2name(padded_model, mujoco.mjtObj.mjOBJ_MESH, mesh_id)
+        geom = spec_geoms[geom_id_to_spec_idx[geom_id]]
+        geom.meshname = mesh_name
+
+    for body_name, variants in body_variants.items():
+      body = next(b for b in spec.bodies if b.name == body_name)
+      mesh_geoms = [g for g in body.geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH]
+      body_id = mujoco.mj_name2id(padded_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+      mesh_geom_ids = [
+        gid
+        for gid in range(padded_model.ngeom)
+        if padded_model.geom_bodyid[gid] == body_id and padded_model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+      ]
+      for var_meshes, _ in variants:
+        if len(mesh_geom_ids) > 0 and len(var_meshes) > 0 and dataid_table[first_world, mesh_geom_ids[0]] == var_meshes[0]:
+          for k, geom in enumerate(mesh_geoms):
+            if k < len(var_meshes):
+              mesh_name = mujoco.mj_id2name(padded_model, mujoco.mjtObj.mjOBJ_MESH, var_meshes[k])
+              geom.meshname = mesh_name
+              geom.contype = 1
+              geom.conaffinity = 1
+            else:
+              geom.contype = 0
+              geom.conaffinity = 0
+              geom.mass = 0
+          break
+
+    compiled_variants[key] = spec.compile()
+
+  # Restore spec state
+  for idx, g in enumerate(spec_geoms):
+    if idx in saved_geom_state:
+      meshname, contype, conaffinity, mass = saved_geom_state[idx]
+      g.meshname = meshname
+      g.contype = contype
+      g.conaffinity = conaffinity
+      g.mass = mass
+
+  # Build per-world arrays from compiled variants
+  ngeom = padded_model.ngeom
+  nbody = padded_model.nbody
+
+  field_arrays = {
+    "geom_size": np.zeros((nworld, ngeom, 3), dtype=np.float32),
+    "geom_rbound": np.zeros((nworld, ngeom), dtype=np.float32),
+    "geom_aabb": np.zeros((nworld, ngeom, 2, 3), dtype=np.float32),
+    "geom_pos": np.zeros((nworld, ngeom, 3), dtype=np.float32),
+    "body_mass": np.zeros((nworld, nbody), dtype=np.float32),
+    "body_subtreemass": np.zeros((nworld, nbody), dtype=np.float32),
+    "body_inertia": np.zeros((nworld, nbody, 3), dtype=np.float32),
+    "body_invweight0": np.zeros((nworld, nbody, 2), dtype=np.float32),
+    "body_ipos": np.zeros((nworld, nbody, 3), dtype=np.float32),
+    "body_iquat": np.zeros((nworld, nbody, 4), dtype=np.float32),
+  }
+
+  for w in range(nworld):
+    key = tuple(dataid_table[w])
+    ref = compiled_variants[key]
+    field_arrays["geom_size"][w] = ref.geom_size
+    field_arrays["geom_rbound"][w] = ref.geom_rbound
+    field_arrays["geom_aabb"][w] = ref.geom_aabb.reshape(ngeom, 2, 3)
+    field_arrays["geom_pos"][w] = ref.geom_pos
+    field_arrays["body_mass"][w] = ref.body_mass
+    field_arrays["body_subtreemass"][w] = ref.body_subtreemass
+    field_arrays["body_inertia"][w] = ref.body_inertia
+    field_arrays["body_invweight0"][w] = ref.body_invweight0
+    field_arrays["body_ipos"][w] = ref.body_ipos
+    field_arrays["body_iquat"][w] = ref.body_iquat
+
+  return field_arrays
 
 
 def _create_array(data: Any, spec: wp.array, sizes: dict[str, int]) -> wp.array | None:
@@ -2395,6 +2859,442 @@ def _build_rays(
   )
 
 
+# ---------------------------------------------------------------------------
+# Heterogeneous asset public API
+# ---------------------------------------------------------------------------
+
+
+def plan_heterogeneous_assets_from_tuples(
+  spec: mujoco.MjSpec,
+) -> HeterogeneousAssetPlan:
+  """Parse mesh-oriented ``<custom><tuple>`` annotations into a canonical plan.
+
+  This is a convenience frontend. The foundational API is
+  ``HeterogeneousAssetPlan`` constructed directly.
+
+  Args:
+    spec: A MuJoCo spec containing optional tuple annotations for mesh
+      variants.
+
+  Returns:
+    A mesh-only plan describing all geom-level and body-level variant sets
+    found in the spec. Returns an empty plan if no tuples are present.
+  """
+  model = spec.compile()
+  plan = HeterogeneousAssetPlan()
+
+  if model.ntuple == 0:
+    return plan
+
+  geom_names = {g.name for g in spec.geoms}
+  body_names = {b.name for b in spec.bodies if b.name}
+  # Names matching both are treated as body-level only.
+  ambiguous = geom_names & body_names
+  geom_names = geom_names - ambiguous
+
+  # Geom-level tuples
+  for tuple_id in range(model.ntuple):
+    tuple_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_TUPLE, tuple_id)
+    if tuple_name not in geom_names:
+      continue
+    start = model.tuple_adr[tuple_id]
+    size = model.tuple_size[tuple_id]
+    # Skip body-level tuples (those containing tuple-type elements).
+    if any(model.tuple_objtype[start + i] == mujoco.mjtObj.mjOBJ_TUPLE for i in range(size)):
+      continue
+
+    candidates = []
+    weights = []
+    for i in range(size):
+      if model.tuple_objtype[start + i] != mujoco.mjtObj.mjOBJ_MESH:
+        continue
+      candidates.append(int(model.tuple_objid[start + i]))
+      weights.append(float(model.tuple_objprm[start + i]))
+
+    if not candidates:
+      continue
+
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, tuple_name)
+    plan.geom_ids.append(geom_id)
+    plan.geom_candidate_dataids.append(candidates)
+    plan.geom_candidate_weights.append(weights)
+
+  # Body-level tuples
+  for tuple_id in range(model.ntuple):
+    tuple_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_TUPLE, tuple_id)
+    if tuple_name not in body_names:
+      continue
+    start = model.tuple_adr[tuple_id]
+    size = model.tuple_size[tuple_id]
+
+    variants = []
+    weights = []
+    for i in range(size):
+      if model.tuple_objtype[start + i] != mujoco.mjtObj.mjOBJ_TUPLE:
+        continue
+      var_tuple_id = model.tuple_objid[start + i]
+      prm = float(model.tuple_objprm[start + i])
+      var_start = model.tuple_adr[var_tuple_id]
+      var_size = model.tuple_size[var_tuple_id]
+      var_meshes = []
+      for j in range(var_size):
+        if model.tuple_objtype[var_start + j] == mujoco.mjtObj.mjOBJ_MESH:
+          var_meshes.append(int(model.tuple_objid[var_start + j]))
+      variants.append(var_meshes)
+      weights.append(prm)
+
+    if not variants:
+      continue
+
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, tuple_name)
+    # Mesh geom slots in this body (we need the padded model later, but
+    # for the plan we just record the body-level variant rows).
+    mesh_geom_ids = [
+      gid
+      for gid in range(model.ngeom)
+      if model.geom_bodyid[gid] == body_id and model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+    ]
+
+    plan.body_ids.append(body_id)
+    plan.body_geom_ids.append(mesh_geom_ids)
+    plan.body_variant_rows.append(variants)
+    plan.body_variant_weights.append(weights)
+
+  return plan
+
+
+def build_heterogeneous_model(
+  spec: mujoco.MjSpec,
+  nworld: int,
+  *,
+  plan: HeterogeneousAssetPlan | None = None,
+  parse_tuples: bool = False,
+  initial_assignment: np.ndarray | None = None,
+) -> types.Model:
+  """Build a per-world Model from a spec with heterogeneous mesh variants.
+
+  If ``plan`` is None and ``parse_tuples`` is False, this behaves like
+  ``put_model(spec.compile())``.
+
+  Args:
+    spec: A MuJoCo spec. The caller's spec is not mutated; heterogeneous
+      normalization happens on an internal copy.
+    nworld: Number of parallel worlds.
+    plan: A canonical heterogeneous asset plan. If None and
+      ``parse_tuples`` is True, a plan is derived from XML tuples.
+    parse_tuples: If True and ``plan`` is None, parse tuple annotations
+      from the spec.
+    initial_assignment: Optional array of shape ``(nworld, num_sets)``
+      where each entry is a variant index. If None, worlds are allocated
+      using the plan's weights via largest-remainder.
+
+  Returns:
+    A Model with per-world ``geom_dataid`` and dependent fields populated.
+    The model has a ``heterogeneous_runtime`` attribute containing the
+    runtime metadata needed for reset-time reassignment.
+
+    In v1 this path supports mesh variants only. Heightfield heterogeneity
+    is not yet implemented here. Use
+    ``model.heterogeneous_runtime.host_model`` when you need a host-side
+    MuJoCo model with the padded heterogeneous layout.
+  """
+  # Resolve plan.
+  if plan is None and parse_tuples:
+    plan = plan_heterogeneous_assets_from_tuples(spec)
+  if plan is None or plan.is_empty:
+    model = spec.compile()
+    m = put_model(model)
+    m.heterogeneous_runtime = None
+    return m
+
+  plan = _copy_heterogeneous_plan(plan)
+  work_spec = spec.copy()
+  model = work_spec.compile()
+  original_ngeom = model.ngeom
+
+  # Track which geoms are real (pre-padding).
+  real_geom_mask = np.ones(model.ngeom, dtype=bool)
+
+  # --- Body padding ---
+  padded = False
+  for set_idx in range(plan.num_body_sets):
+    body_id = plan.body_ids[set_idx]
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+    variant_rows = plan.body_variant_rows[set_idx]
+    max_geoms = max(len(row) for row in variant_rows)
+
+    body = next(b for b in work_spec.bodies if b.name == body_name)
+    current_mesh_geoms = [g for g in body.geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH]
+
+    if max_geoms > len(current_mesh_geoms):
+      # Find a mesh name from the longest variant to use as placeholder.
+      longest = max(variant_rows, key=len)
+      for k in range(len(current_mesh_geoms), max_geoms):
+        mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, longest[k])
+        geom = body.add_geom()
+        geom.type = mujoco.mjtGeom.mjGEOM_MESH
+        geom.meshname = mesh_name
+        geom.contype = 0
+        geom.conaffinity = 0
+      padded = True
+
+  if padded:
+    model = work_spec.compile()
+    # Mark new geoms as padding.
+    real_geom_mask = np.ones(model.ngeom, dtype=bool)
+    real_geom_mask[original_ngeom:] = False
+
+    # Update body_geom_ids in the plan to reflect padded model.
+    for set_idx in range(plan.num_body_sets):
+      body_id = plan.body_ids[set_idx]
+      mesh_geom_ids = [
+        gid
+        for gid in range(model.ngeom)
+        if model.geom_bodyid[gid] == body_id and model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+      ]
+      plan.body_geom_ids[set_idx] = mesh_geom_ids
+
+  m = put_model(model)
+  ngeom = model.ngeom
+
+  # --- Build dataid table ---
+  base_dataid = model.geom_dataid.copy()
+  dataid_table = np.tile(base_dataid, (nworld, 1))
+
+  # Track geom_variants and body_variants for _populate_dependent_fields.
+  geom_variants = {}
+  body_variants = {}
+
+  # Collect all candidate mesh IDs across all variants.
+  all_mesh_ids = set(base_dataid[base_dataid >= 0].astype(int))
+
+  # --- Build assignment ---
+  num_sets = plan.num_sets
+  if initial_assignment is not None:
+    assignment = initial_assignment
+  else:
+    assignment = np.zeros((nworld, num_sets), dtype=int)
+
+  # Geom-level sets
+  for s in range(plan.num_geom_sets):
+    geom_id = plan.geom_ids[s]
+    candidates = plan.geom_candidate_dataids[s]
+    weights = plan.geom_candidate_weights[s]
+
+    for did in candidates:
+      if did >= 0:
+        all_mesh_ids.add(did)
+
+    geom_variants[geom_id] = [(did, w) for did, w in zip(candidates, weights or [1.0] * len(candidates))]
+
+    if initial_assignment is None:
+      prm_candidates = list(zip(candidates, weights or [1.0] * len(candidates)))
+      world_assignment = _allocate_worlds(prm_candidates, nworld)
+      for w in range(nworld):
+        assignment[w, s] = world_assignment[w]
+
+    for w in range(nworld):
+      variant_idx = int(assignment[w, s])
+      dataid_table[w, geom_id] = candidates[variant_idx]
+
+  # Body-level sets
+  for s in range(plan.num_body_sets):
+    col = plan.num_geom_sets + s
+    body_id = plan.body_ids[s]
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+    variant_rows = plan.body_variant_rows[s]
+    weights = plan.body_variant_weights[s]
+    mesh_geom_ids = plan.body_geom_ids[s]
+
+    for row in variant_rows:
+      for did in row:
+        if did >= 0:
+          all_mesh_ids.add(did)
+
+    body_variants[body_name] = [(row, w) for row, w in zip(variant_rows, weights or [1.0] * len(variant_rows))]
+
+    if initial_assignment is None:
+      prm_candidates = [(0, w) for w in (weights or [1.0] * len(variant_rows))]
+      world_assignment = _allocate_worlds(prm_candidates, nworld)
+      for w in range(nworld):
+        assignment[w, col] = world_assignment[w]
+
+    for w in range(nworld):
+      variant_idx = int(assignment[w, col])
+      var_meshes = variant_rows[variant_idx]
+      for k, geom_id in enumerate(mesh_geom_ids):
+        if k < len(var_meshes):
+          dataid_table[w, geom_id] = var_meshes[k]
+        else:
+          dataid_table[w, geom_id] = -1
+
+  m.geom_dataid = wp.array(dataid_table, dtype=int)
+
+  # --- Populate dependent fields ---
+  field_arrays = _populate_dependent_fields(work_spec, model, dataid_table, nworld, geom_variants, body_variants)
+
+  for field_name, arr in field_arrays.items():
+    dtype = _DEPENDENT_FIELD_DTYPES[field_name]
+    setattr(m, field_name, wp.array(arr, dtype=dtype))
+
+  # --- Build variant cache for reset-time reassignment ---
+  # Index unique dataid rows and their field values.
+  unique_keys = []
+  unique_indices = {}
+  for w in range(nworld):
+    key = tuple(dataid_table[w])
+    if key not in unique_indices:
+      unique_indices[key] = len(unique_keys)
+      unique_keys.append(key)
+
+  n_unique = len(unique_keys)
+  variant_row_keys = np.array(unique_keys, dtype=int)
+
+  variant_field_values = {}
+  for field_name, arr in field_arrays.items():
+    first_worlds = [next(w for w in range(nworld) if tuple(dataid_table[w]) == key) for key in unique_keys]
+    variant_field_values[field_name] = arr[first_worlds]
+
+  # --- Assemble runtime ---
+  runtime = HeterogeneousAssetRuntime(
+    affected_fields=_DEPENDENT_FIELDS,
+    required_recompute=HeterogeneousRecompute.SET_CONST,
+    host_model=model,
+    candidate_mesh_ids=(np.array(sorted(all_mesh_ids), dtype=int) if all_mesh_ids else None),
+    candidate_hfield_ids=None,
+    initial_assignment=assignment,
+    real_geom_mask=real_geom_mask,
+    plan=plan,
+    variant_row_keys=variant_row_keys,
+    variant_field_values=variant_field_values,
+    dataid_table=dataid_table,
+  )
+  m.heterogeneous_runtime = runtime
+
+  return m
+
+
+def apply_heterogeneous_assignments(
+  model: types.Model,
+  *,
+  env_ids: np.ndarray | None = None,
+  assignment: np.ndarray,
+) -> None:
+  """Update per-world heterogeneous assignments without replacing arrays.
+
+  This copies cached variant field values into the model's per-world arrays
+  for the selected worlds. Array addresses are not changed, only contents
+  are mutated, so this is safe to call after CUDA graph capture.
+
+  Args:
+    model: A Model previously created by ``build_heterogeneous_model``.
+    env_ids: Which worlds to update. If None, updates all worlds. Array of
+      world indices.
+    assignment: Variant indices of shape ``(len(env_ids), num_sets)`` or
+      ``(nworld, num_sets)`` when env_ids is None. Each entry is a variant
+      index into the plan's candidate lists.
+  """
+  runtime = model.heterogeneous_runtime
+  if runtime is None:
+    raise ValueError("Model was not built with build_heterogeneous_model or has no heterogeneous variants.")
+
+  plan = runtime._plan
+  dataid_table = runtime._dataid_table
+
+  if env_ids is None:
+    nworld = dataid_table.shape[0]
+    env_ids_np = np.arange(nworld)
+  else:
+    env_ids_np = np.asarray(env_ids)
+
+  n_envs = len(env_ids_np)
+  assignment = np.asarray(assignment)
+
+  if assignment.ndim != 2:
+    raise ValueError(f"assignment must be a rank-2 array with shape ({n_envs}, {runtime.num_sets})")
+  if assignment.shape[1] != runtime.num_sets:
+    raise ValueError(f"assignment has wrong number of set columns: expected {runtime.num_sets}, got {assignment.shape[1]}")
+  if assignment.shape[0] != n_envs:
+    raise ValueError(f"assignment row count must match len(env_ids): expected {n_envs}, got {assignment.shape[0]}")
+
+  # Build new dataid rows for the selected worlds.
+  new_dataid = dataid_table[env_ids_np].copy()
+
+  for s in range(plan.num_geom_sets):
+    geom_id = plan.geom_ids[s]
+    candidates = plan.geom_candidate_dataids[s]
+    for i in range(n_envs):
+      variant_idx = int(assignment[i, s])
+      new_dataid[i, geom_id] = candidates[variant_idx]
+
+  for s in range(plan.num_body_sets):
+    col = plan.num_geom_sets + s
+    mesh_geom_ids = plan.body_geom_ids[s]
+    variant_rows = plan.body_variant_rows[s]
+    for i in range(n_envs):
+      variant_idx = int(assignment[i, col])
+      var_meshes = variant_rows[variant_idx]
+      for k, geom_id in enumerate(mesh_geom_ids):
+        if k < len(var_meshes):
+          new_dataid[i, geom_id] = var_meshes[k]
+        else:
+          new_dataid[i, geom_id] = -1
+
+  # Update the stored dataid table.
+  dataid_table[env_ids_np] = new_dataid
+
+  # Map each new dataid row to its cached variant fields.
+  variant_row_keys = runtime._variant_row_keys
+  variant_field_values = runtime._variant_field_values
+
+  # Build a lookup from key tuple to variant index.
+  key_to_idx = {tuple(row): idx for idx, row in enumerate(variant_row_keys)}
+
+  # Check if any new rows are not in the cache (this means the assignment
+  # uses combinations not seen at build time).
+  missing = []
+  for i in range(n_envs):
+    key = tuple(new_dataid[i])
+    if key not in key_to_idx:
+      missing.append(i)
+
+  if missing:
+    raise ValueError(
+      f"Assignment for env(s) {missing} produced dataid rows not present"
+      " in the variant cache. Ensure assignments use valid variant indices"
+      " from the plan."
+    )
+
+  variant_ids_np = np.array([key_to_idx[tuple(new_dataid[i])] for i in range(n_envs)], dtype=int)
+  env_ids_wp = wp.array(env_ids_np, dtype=int)
+  selected_dataid_wp = wp.array(variant_row_keys[variant_ids_np], dtype=int)
+
+  # Copy cached rows into the model arrays for affected worlds.
+  _scatter_selected_rows_to_field(
+    "geom_dataid",
+    selected_dataid_wp,
+    env_ids_wp,
+    model.geom_dataid,
+  )
+  for field_name in runtime._affected_fields:
+    cached = variant_field_values[field_name]
+    dtype = _DEPENDENT_FIELD_DTYPES[field_name]
+    selected_field_wp = wp.array(cached[variant_ids_np], dtype=dtype)
+    _scatter_selected_rows_to_field(
+      field_name,
+      selected_field_wp,
+      env_ids_wp,
+      getattr(model, field_name),
+    )
+
+  # Reassignment is a host-side reset path in v1, so synchronize before
+  # temporary Warp arrays go out of scope.
+  wp.synchronize()
+
+  # Update the runtime's stored assignment.
+  runtime._initial_assignment[env_ids_np] = assignment
+
+
 def create_render_context(
   mjm: mujoco.MjModel,
   nworld: int = 1,
@@ -2407,6 +3307,8 @@ def create_render_context(
   cam_active: list[bool] | None = None,
   flex_render_smooth: bool = True,
   use_precomputed_rays: bool = True,
+  preload_mesh_ids: list[int] | np.ndarray | None = None,
+  preload_hfield_ids: list[int] | np.ndarray | None = None,
 ) -> types.RenderContext:
   """Creates a render context on device.
 
@@ -2425,6 +3327,14 @@ def create_render_context(
     flex_render_smooth: Whether to render flex meshes smoothly.
     use_precomputed_rays: Use precomputed rays instead of computing during rendering.
                           When using domain randomization for camera intrinsics, set to False.
+    preload_mesh_ids: Additional mesh IDs to build BVHs for, beyond those
+                      referenced by the host model's default geom_dataid.
+                      Use this with heterogeneous assets to ensure all
+                      candidate meshes have BVHs.
+    preload_hfield_ids: Additional heightfield IDs to build BVHs for.
+                      This is independent of heterogeneous mesh builds; v1
+                      heterogeneous runtime metadata does not populate hfield
+                      candidates automatically.
 
   Returns:
     The render context containing rendering fields and output arrays on device.
@@ -2442,6 +3352,8 @@ def create_render_context(
   geom_enabled_mask = np.isin(mjm.geom_group, list(enabled_geom_groups))
   mesh_geom_mask = geom_enabled_mask & (mjm.geom_type == types.GeomType.MESH) & (mjm.geom_dataid >= 0)
   used_mesh_id = set(mjm.geom_dataid[mesh_geom_mask].astype(int))
+  if preload_mesh_ids is not None:
+    used_mesh_id |= set(int(x) for x in preload_mesh_ids)
   geom_enabled_idx = np.nonzero(geom_enabled_mask)[0]
 
   mesh_registry = {}
@@ -2461,6 +3373,8 @@ def create_render_context(
   nhfield = mjm.nhfield
   hfield_geom_mask = geom_enabled_mask & (mjm.geom_type == types.GeomType.HFIELD) & (mjm.geom_dataid >= 0)
   used_hfield_id = set(mjm.geom_dataid[hfield_geom_mask].astype(int))
+  if preload_hfield_ids is not None:
+    used_hfield_id |= set(int(x) for x in preload_hfield_ids)
   hfield_registry = {}
   hfield_bvh_id = [wp.uint64(0) for _ in range(nhfield)]
   hfield_bounds_size = [wp.vec3(0.0, 0.0, 0.0) for _ in range(nhfield)]
