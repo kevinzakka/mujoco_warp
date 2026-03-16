@@ -54,6 +54,7 @@ from mujoco_warp._src.io import make_data as make_data
 from mujoco_warp._src.io import per_world_mesh as per_world_mesh
 from mujoco_warp._src.io import put_data as put_data
 from mujoco_warp._src.io import put_model as put_model
+from mujoco_warp._src.io import reassign_per_world_meshes as reassign_per_world_meshes
 from mujoco_warp._src.io import reset_data as reset_data
 from mujoco_warp._src.io import set_const as set_const
 from mujoco_warp._src.io import set_const_0 as set_const_0

@@ -1970,6 +1970,105 @@ class IOTest(parameterized.TestCase):
     geom_pos = m.geom_pos.numpy()
     self.assertEqual(geom_pos.shape[0], nworld)
 
+  # --- PerWorldMeshResult metadata tests ---
+
+  def test_result_host_model(self):
+    """host_model matches the padded model layout."""
+    nworld = 4
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    result = per_world_mesh(spec, nworld)
+
+    self.assertEqual(result.host_model.ngeom, result.model.ngeom)
+    self.assertIsInstance(result.host_model, mujoco.MjModel)
+
+  def test_result_real_geom_mask(self):
+    """real_geom_mask marks padded geoms as False."""
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    mjm = spec.compile()
+    original_ngeom = mjm.ngeom
+
+    result = per_world_mesh(spec, nworld=4)
+
+    self.assertGreater(result.model.ngeom, original_ngeom)
+    self.assertEqual(len(result.real_geom_mask), result.model.ngeom)
+    self.assertTrue(all(result.real_geom_mask[:original_ngeom]))
+    self.assertFalse(any(result.real_geom_mask[original_ngeom:]))
+
+  def test_result_candidate_mesh_ids(self):
+    """candidate_mesh_ids contains all meshes from all variants."""
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    mjm = spec.compile()
+
+    result = per_world_mesh(spec, nworld=4)
+
+    for mid in range(mjm.nmesh):
+      self.assertIn(mid, result.candidate_mesh_ids)
+
+  # --- reassign_per_world_meshes tests ---
+
+  def test_reassign_changes_selected_worlds(self):
+    """reassign_per_world_meshes updates only the specified worlds."""
+    from mujoco_warp._src.io import reassign_per_world_meshes
+
+    nworld = 4
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    result = per_world_mesh(spec, nworld)
+
+    old_dataid = result.model.geom_dataid.numpy().copy()
+    n_variants = len(result.variant_keys)
+    self.assertGreater(n_variants, 1)
+
+    # Reassign world 0 to a different variant.
+    old_variant = 0
+    for vi in range(n_variants):
+      if not np.array_equal(result.variant_keys[vi], old_dataid[0]):
+        new_variant = vi
+        break
+    else:
+      self.fail("Could not find a different variant.")
+
+    reassign_per_world_meshes(
+      result,
+      env_ids=np.array([0]),
+      variant_indices=np.array([new_variant]),
+    )
+
+    new_dataid = result.model.geom_dataid.numpy()
+    self.assertFalse(np.array_equal(old_dataid[0], new_dataid[0]))
+    np.testing.assert_array_equal(old_dataid[1:], new_dataid[1:])
+
+  def test_reassign_updates_dependent_fields(self):
+    """reassign_per_world_meshes propagates dependent field values."""
+    from mujoco_warp._src.io import reassign_per_world_meshes
+
+    nworld = 4
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    result = per_world_mesh(spec, nworld)
+
+    n_variants = len(result.variant_keys)
+    self.assertGreater(n_variants, 1)
+
+    # Set all worlds to variant 0, then reassign world 0 to variant 1.
+    reassign_per_world_meshes(
+      result,
+      env_ids=np.arange(nworld),
+      variant_indices=np.zeros(nworld, dtype=int),
+    )
+    reassign_per_world_meshes(
+      result,
+      env_ids=np.array([0]),
+      variant_indices=np.array([1]),
+    )
+
+    body_mass = result.model.body_mass.numpy()
+    # World 0 should differ from world 1 (different variant).
+    self.assertFalse(np.allclose(body_mass[0], body_mass[1]))
+
+    # World 0 should match the cached value for variant 1.
+    if "body_mass" in result.variant_fields:
+      expected = result.variant_fields["body_mass"][1]
+      np.testing.assert_allclose(body_mass[0], expected, atol=1e-6)
+
 
 if __name__ == "__main__":
   wp.init()

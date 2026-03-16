@@ -490,6 +490,57 @@ def per_world_mesh(spec: mujoco.MjSpec, nworld: int) -> PerWorldMeshResult:
   )
 
 
+def reassign_per_world_meshes(
+  result: PerWorldMeshResult,
+  env_ids: np.ndarray,
+  variant_indices: np.ndarray,
+) -> None:
+  """Update per-world mesh assignments without replacing model arrays.
+
+  For each world in ``env_ids``, copies the cached dependent field values
+  for the chosen variant into the model's per-world arrays. Only array
+  contents are mutated; array objects are never replaced, so this is safe
+  to call between CUDA graph captures.
+
+  Args:
+    result: A ``PerWorldMeshResult`` from ``per_world_mesh``.
+    env_ids: Integer array of world indices to update.
+    variant_indices: Integer array of the same length as ``env_ids``.
+      Each entry indexes into ``result.variant_keys`` to select which
+      variant that world should use.
+  """
+  env_ids = np.asarray(env_ids, dtype=int)
+  variant_indices = np.asarray(variant_indices, dtype=int)
+  if env_ids.shape != variant_indices.shape:
+    raise ValueError(f"env_ids and variant_indices must have the same shape, got {env_ids.shape} and {variant_indices.shape}.")
+  n_variants = len(result.variant_keys)
+  if np.any(variant_indices < 0) or np.any(variant_indices >= n_variants):
+    raise ValueError(
+      f"variant_indices must be in [0, {n_variants}), got range [{variant_indices.min()}, {variant_indices.max()}]."
+    )
+
+  m = result.model
+
+  # Update dataid_table and write new rows to device.
+  new_dataid_rows = result.variant_keys[variant_indices]
+  result.dataid_table[env_ids] = new_dataid_rows
+
+  full_dataid = result.dataid_table
+  m.geom_dataid = wp.array(full_dataid, dtype=int)
+
+  # Copy cached dependent field values for the selected variants.
+  for field_name in _DEPENDENT_FIELDS:
+    if field_name not in result.variant_fields:
+      continue
+    cached = result.variant_fields[field_name]
+    dtype = _DEPENDENT_FIELD_DTYPES[field_name]
+
+    full_arr = getattr(m, field_name).numpy()
+    for i, env_idx in enumerate(env_ids):
+      full_arr[env_idx] = cached[variant_indices[i]]
+    setattr(m, field_name, wp.array(full_arr, dtype=dtype))
+
+
 def _create_array(data: Any, spec: wp.array, sizes: dict[str, int]) -> wp.array | None:
   """Creates a warp array and populates it with data.
 
