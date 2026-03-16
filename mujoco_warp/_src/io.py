@@ -38,6 +38,35 @@ from mujoco_warp._src.util_pkg import check_version
 # Per-world mesh support
 # ---------------------------------------------------------------------------
 
+
+@dataclasses.dataclass
+class PerWorldMeshPlan:
+  """Programmatic body-level variant definitions for ``per_world_mesh``.
+
+  This is an alternative to declaring variants via ``<custom><tuple>``
+  annotations in XML. Downstream libraries can build a plan in Python
+  and pass it to ``per_world_mesh(spec, nworld, plan=plan)``.
+
+  For set *i*, the mesh geoms of body ``body_ids[i]`` can take any of
+  the dataid rows in ``body_variant_rows[i]``. Use ``-1`` in a row to
+  disable a geom slot for that variant (for bodies where different
+  variants have different numbers of collision pieces).
+
+  ``body_geom_ids[i]`` gives the mesh geom IDs belonging to that body
+  in the compiled model. If body padding is needed (variants with
+  different geom counts), ``per_world_mesh`` handles it automatically.
+  """
+
+  body_ids: list[int] = dataclasses.field(default_factory=list)
+  body_geom_ids: list[list[int]] = dataclasses.field(default_factory=list)
+  body_variant_rows: list[list[list[int]]] = dataclasses.field(default_factory=list)
+  body_variant_weights: list[list[float] | None] = dataclasses.field(default_factory=list)
+
+  @property
+  def is_empty(self) -> bool:
+    return len(self.body_ids) == 0
+
+
 _DEPENDENT_FIELDS = (
   "geom_size",
   "geom_rbound",
@@ -286,12 +315,146 @@ def _compile_variants(spec, padded_model, dataid_table, nworld, geom_variants, b
   return field_arrays, variant_cache
 
 
-def per_world_mesh(spec: mujoco.MjSpec, nworld: int) -> PerWorldMeshResult:
-  """Per-world mesh randomization from custom/tuple annotations.
+def _trivial_result(model: mujoco.MjModel) -> PerWorldMeshResult:
+  """Build a no-op result when there are no mesh variants."""
+  m = put_model(model)
+  return PerWorldMeshResult(
+    model=m,
+    host_model=model,
+    candidate_mesh_ids=np.array(
+      sorted(set(model.geom_dataid[model.geom_dataid >= 0].astype(int))),
+      dtype=int,
+    ),
+    real_geom_mask=np.ones(model.ngeom, dtype=bool),
+    dataid_table=np.tile(model.geom_dataid.copy(), (1, 1)),
+    variant_keys=np.array([model.geom_dataid.copy()], dtype=int),
+    variant_fields={},
+  )
 
-  Parses ``<custom><tuple>`` annotations in the spec to determine which
-  geoms and bodies have mesh variants, then builds a batched Model where
-  each world can use a different mesh for those slots.
+
+def _per_world_mesh_from_plan(
+  spec: mujoco.MjSpec,
+  model: mujoco.MjModel,
+  nworld: int,
+  plan: PerWorldMeshPlan,
+) -> PerWorldMeshResult:
+  """Build per-world meshes from a programmatic plan."""
+  original_ngeom = model.ngeom
+
+  # --- Body padding ---
+  padded = False
+  for set_idx in range(len(plan.body_ids)):
+    body_id = plan.body_ids[set_idx]
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+    variant_rows = plan.body_variant_rows[set_idx]
+    max_geoms = max(len(row) for row in variant_rows)
+
+    body = next(b for b in spec.bodies if b.name == body_name)
+    current_mesh_geoms = [g for g in body.geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH]
+
+    if max_geoms > len(current_mesh_geoms):
+      longest = max(variant_rows, key=len)
+      for k in range(len(current_mesh_geoms), max_geoms):
+        mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, longest[k])
+        geom = body.add_geom()
+        geom.type = mujoco.mjtGeom.mjGEOM_MESH
+        geom.meshname = mesh_name
+        geom.contype = 0
+        geom.conaffinity = 0
+      padded = True
+
+  if padded:
+    model = spec.compile()
+
+  real_geom_mask = np.ones(model.ngeom, dtype=bool)
+  if padded:
+    real_geom_mask[original_ngeom:] = False
+
+  # Refresh body_geom_ids after padding.
+  body_geom_ids_resolved = []
+  for set_idx in range(len(plan.body_ids)):
+    body_id = plan.body_ids[set_idx]
+    mesh_geom_ids = [
+      gid
+      for gid in range(model.ngeom)
+      if model.geom_bodyid[gid] == body_id and model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+    ]
+    body_geom_ids_resolved.append(mesh_geom_ids)
+
+  m = put_model(model)
+  ngeom = model.ngeom
+
+  base_dataid = model.geom_dataid.copy()
+  dataid_table = np.tile(base_dataid, (nworld, 1))
+
+  body_variants = {}
+  all_mesh_ids = set(base_dataid[base_dataid >= 0].astype(int))
+
+  for set_idx in range(len(plan.body_ids)):
+    body_id = plan.body_ids[set_idx]
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+    variant_rows = plan.body_variant_rows[set_idx]
+    weights = plan.body_variant_weights[set_idx] if set_idx < len(plan.body_variant_weights) else None
+    mesh_geom_ids = body_geom_ids_resolved[set_idx]
+
+    for row in variant_rows:
+      for did in row:
+        if did >= 0:
+          all_mesh_ids.add(did)
+
+    body_variants[body_name] = [(row, w) for row, w in zip(variant_rows, weights or [1.0] * len(variant_rows))]
+
+    prm_candidates = [(0, w) for w in (weights or [1.0] * len(variant_rows))]
+    assignment = _allocate_worlds(prm_candidates, nworld)
+
+    for w in range(nworld):
+      variant_idx = assignment[w]
+      var_meshes = variant_rows[variant_idx]
+      for k, geom_id in enumerate(mesh_geom_ids):
+        if k < len(var_meshes):
+          dataid_table[w, geom_id] = var_meshes[k]
+        else:
+          dataid_table[w, geom_id] = -1
+
+  if not body_variants:
+    return _trivial_result(model)
+
+  m.geom_dataid = wp.array(dataid_table, dtype=int)
+
+  field_arrays, variant_cache = _compile_variants(spec, model, dataid_table, nworld, {}, body_variants)
+
+  for field_name, arr in field_arrays.items():
+    dtype = _DEPENDENT_FIELD_DTYPES[field_name]
+    setattr(m, field_name, wp.array(arr, dtype=dtype))
+
+  keys = list(variant_cache.keys())
+  variant_keys = np.array(keys, dtype=int)
+  variant_fields = {}
+  for field_name in _DEPENDENT_FIELDS:
+    variant_fields[field_name] = np.stack([variant_cache[key][field_name] for key in keys])
+
+  return PerWorldMeshResult(
+    model=m,
+    host_model=model,
+    candidate_mesh_ids=np.array(sorted(all_mesh_ids), dtype=int),
+    real_geom_mask=real_geom_mask,
+    dataid_table=dataid_table,
+    variant_keys=variant_keys,
+    variant_fields=variant_fields,
+  )
+
+
+def per_world_mesh(
+  spec: mujoco.MjSpec,
+  nworld: int,
+  *,
+  plan: PerWorldMeshPlan | None = None,
+) -> PerWorldMeshResult:
+  """Per-world mesh randomization.
+
+  When ``plan`` is provided, uses the programmatic body-level variant
+  definitions directly. Otherwise, parses ``<custom><tuple>`` annotations
+  in the spec.
 
   Returns a ``PerWorldMeshResult`` containing the model, padded host model,
   candidate mesh IDs for render preloading, a real-geom mask for filtering
@@ -299,22 +462,14 @@ def per_world_mesh(spec: mujoco.MjSpec, nworld: int) -> PerWorldMeshResult:
   """
   model = spec.compile()
 
-  # No-op: return trivial result when no tuples are present.
+  if plan is not None:
+    if plan.is_empty:
+      return _trivial_result(model)
+    return _per_world_mesh_from_plan(spec, model, nworld, plan)
+
+  # No-op when no tuples.
   if model.ntuple == 0:
-    m = put_model(model)
-    ngeom = model.ngeom
-    return PerWorldMeshResult(
-      model=m,
-      host_model=model,
-      candidate_mesh_ids=np.array(
-        sorted(set(model.geom_dataid[model.geom_dataid >= 0].astype(int))),
-        dtype=int,
-      ),
-      real_geom_mask=np.ones(ngeom, dtype=bool),
-      dataid_table=np.tile(model.geom_dataid.copy(), (1, 1)),
-      variant_keys=np.array([model.geom_dataid.copy()], dtype=int),
-      variant_fields={},
-    )
+    return _trivial_result(model)
 
   original_ngeom = model.ngeom
   body_names = {b.name for b in spec.bodies if b.name}

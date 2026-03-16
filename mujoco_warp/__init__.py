@@ -47,6 +47,7 @@ from mujoco_warp._src.forward import rungekutta4 as rungekutta4
 from mujoco_warp._src.forward import step1 as step1
 from mujoco_warp._src.forward import step2 as step2
 from mujoco_warp._src.inverse import inverse as inverse
+from mujoco_warp._src.io import PerWorldMeshPlan as PerWorldMeshPlan
 from mujoco_warp._src.io import PerWorldMeshResult as PerWorldMeshResult
 from mujoco_warp._src.io import create_render_context as create_render_context
 from mujoco_warp._src.io import get_data_into as get_data_into

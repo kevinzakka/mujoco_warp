@@ -2069,6 +2069,65 @@ class IOTest(parameterized.TestCase):
       expected = result.variant_fields["body_mass"][1]
       np.testing.assert_allclose(body_mass[0], expected, atol=1e-6)
 
+  # --- PerWorldMeshPlan tests ---
+
+  def test_plan_body_level_variants(self):
+    """per_world_mesh with a programmatic plan produces correct dataid."""
+    from mujoco_warp._src.io import PerWorldMeshPlan
+
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    mjm = spec.compile()
+
+    # Build a plan for the "object" body with its two tuple variants.
+    object_body_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "object")
+    mesh_geom_ids = [
+      gid
+      for gid in range(mjm.ngeom)
+      if mjm.geom_bodyid[gid] == object_body_id and mjm.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH
+    ]
+    object_A_0 = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_MESH, "object_A_0")
+    object_A_1 = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_MESH, "object_A_1")
+    object_A_2 = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_MESH, "object_A_2")
+    object_B_0 = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_MESH, "object_B_0")
+    object_B_1 = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_MESH, "object_B_1")
+
+    plan = PerWorldMeshPlan(
+      body_ids=[object_body_id],
+      body_geom_ids=[mesh_geom_ids],
+      body_variant_rows=[
+        [
+          [object_A_0, object_A_1, object_A_2],
+          [object_B_0, object_B_1],
+        ]
+      ],
+      body_variant_weights=[[0.6, 0.4]],
+    )
+
+    nworld = 10
+    result = per_world_mesh(spec, nworld, plan=plan)
+
+    self.assertIsNotNone(result.host_model)
+    self.assertGreater(result.model.ngeom, mjm.ngeom)  # padding occurred
+
+    dataid = result.model.geom_dataid.numpy()
+    self.assertEqual(dataid.shape[0], nworld)
+
+    # Both variants should appear across worlds.
+    padded_mjm = result.host_model
+    object_col_0 = mujoco.mj_name2id(padded_mjm, mujoco.mjtObj.mjOBJ_GEOM, "object_col_0")
+    first_geom_ids = set(dataid[:, object_col_0])
+    self.assertIn(object_A_0, first_geom_ids)
+    self.assertIn(object_B_0, first_geom_ids)
+
+  def test_plan_empty_is_noop(self):
+    """Empty plan produces a trivial result."""
+    from mujoco_warp._src.io import PerWorldMeshPlan
+
+    spec = mujoco.MjSpec.from_string(_MESH_RANDOMIZE_XML)
+    plan = PerWorldMeshPlan()
+    result = per_world_mesh(spec, nworld=4, plan=plan)
+    self.assertEqual(result.dataid_table.shape[0], 1)
+
 
 if __name__ == "__main__":
   wp.init()
