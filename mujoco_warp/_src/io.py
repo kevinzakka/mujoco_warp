@@ -2862,6 +2862,8 @@ def create_render_context(
   cam_active: list[bool] | None = None,
   flex_render_smooth: bool = True,
   use_precomputed_rays: bool = True,
+  preload_mesh_ids: list[int] | np.ndarray | None = None,
+  preload_hfield_ids: list[int] | np.ndarray | None = None,
 ) -> types.RenderContext:
   """Creates a render context on device.
 
@@ -2880,6 +2882,11 @@ def create_render_context(
     flex_render_smooth: Whether to render flex meshes smoothly.
     use_precomputed_rays: Use precomputed rays instead of computing during rendering.
                           When using domain randomization for camera intrinsics, set to False.
+    preload_mesh_ids: Additional mesh IDs to build BVHs for, beyond those
+                      referenced by the host model's default geom_dataid.
+                      Use with per-world meshes to ensure all candidate
+                      meshes have BVHs for rendering and raycasting.
+    preload_hfield_ids: Additional heightfield IDs to build BVHs for.
 
   Returns:
     The render context containing rendering fields and output arrays on device.
@@ -2897,6 +2904,8 @@ def create_render_context(
   geom_enabled_mask = np.isin(mjm.geom_group, list(enabled_geom_groups))
   mesh_geom_mask = geom_enabled_mask & (mjm.geom_type == types.GeomType.MESH) & (mjm.geom_dataid >= 0)
   used_mesh_id = set(mjm.geom_dataid[mesh_geom_mask].astype(int))
+  if preload_mesh_ids is not None:
+    used_mesh_id |= set(int(x) for x in preload_mesh_ids)
   geom_enabled_idx = np.nonzero(geom_enabled_mask)[0]
 
   mesh_registry = {}
@@ -2916,6 +2925,8 @@ def create_render_context(
   nhfield = mjm.nhfield
   hfield_geom_mask = geom_enabled_mask & (mjm.geom_type == types.GeomType.HFIELD) & (mjm.geom_dataid >= 0)
   used_hfield_id = set(mjm.geom_dataid[hfield_geom_mask].astype(int))
+  if preload_hfield_ids is not None:
+    used_hfield_id |= set(int(x) for x in preload_hfield_ids)
   hfield_registry = {}
   hfield_bvh_id = [wp.uint64(0) for _ in range(nhfield)]
   hfield_bounds_size = [wp.vec3(0.0, 0.0, 0.0) for _ in range(nhfield)]
